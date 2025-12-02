@@ -1,6 +1,4 @@
 def solve_part1(data: str) -> str:
-    # Решение части 1. data — содержимое input.txt.
-    # TODO: реализовать
     floor = 0
     for ch in data:
         if ch == "(":
@@ -11,8 +9,6 @@ def solve_part1(data: str) -> str:
 
 
 def solve_part2(data: str) -> str:
-    # Решение части 2. data — содержимое input.txt.
-    # TODO: реализовать
     floor = 0
     # Позиции в задаче считаются с 1
     for i, ch in enumerate(data, start=1):

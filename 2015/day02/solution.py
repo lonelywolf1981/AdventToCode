@@ -1,6 +1,4 @@
 def solve_part1(data: str) -> str:
-    # Решение части 1. data — содержимое input.txt.
-    # TODO: реализовать
     total = 0
     for line in data.strip().splitlines():
         l, w, h = map(int, line.split("x"))
@@ -12,8 +10,6 @@ def solve_part1(data: str) -> str:
 
 
 def solve_part2(data: str) -> str:
-    # Решение части 2. data — содержимое input.txt.
-    # TODO: реализовать
     total = 0
     for line in data.strip().splitlines():
         l, w, h = map(int, line.split("x"))
