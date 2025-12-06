@@ -4,11 +4,12 @@ from collections import deque
 from pathlib import Path
 import itertools
 import re
+from typing import Dict, List, Tuple, Set, Optional
 
 
-# ------------------------------
-#  Intcode — твой симулятор
-# ------------------------------
+# =========================
+#   Intcode-машина (твоя)
+# =========================
 
 class Intcode:
     def __init__(self, code):
@@ -16,7 +17,7 @@ class Intcode:
         self.ip = 0
         self.rb = 0
         self.inp = deque()
-        self.out = []
+        self.out: List[int] = []
         self.halted = False
 
     def _get(self, i):
@@ -48,9 +49,8 @@ class Intcode:
     def run_until_input(self):
         """
         Крутит программу до тех пор, пока:
-        - не понадобится ввод (opcode 3 с пустым self.inp), или
-        - программа не завершится (opcode 99, self.halted = True).
-        Всё, что выводится, попадает в self.out.
+        - не закончится (opcode 99), или
+        - не понадобится ввод (opcode 3 при пустом inp).
         """
         while True:
             op = self._get(self.ip)
@@ -86,8 +86,8 @@ class Intcode:
                     self.ip += 3
 
             elif opcode == 3:
+                # Нужен ввод
                 if not self.inp:
-                    # ждём ввод
                     return
                 dst = self._addr(1, m1)
                 self._set(dst, self.inp.popleft())
@@ -107,180 +107,386 @@ class Intcode:
                 raise RuntimeError("bad opcode " + str(opcode))
 
 
-# ------------------------------
-#  Вспомогательные функции
-# ------------------------------
+# =========================
+#   Константы и утилиты
+# =========================
 
-def parse_program(text: str) -> list[int]:
-    return [int(x) for x in text.replace("\n", ",").split(",") if x.strip()]
+FORBIDDEN_ITEMS: Set[str] = {
+    "escape pod",
+    "infinite loop",
+    "giant electromagnet",
+    "molten lava",
+    "photons",
+}
+
+OPPOSITE = {
+    "north": "south",
+    "south": "north",
+    "east": "west",
+    "west": "east",
+}
 
 
-def run_script(program: list[int], commands: list[str]) -> str:
+def flush_output(comp: Intcode) -> str:
+    """Считать и очистить всё, что накопилось в comp.out, вернуть как строку."""
+    chars: List[str] = []
+    while comp.out:
+        chars.append(chr(comp.out.pop(0)))
+    return "".join(chars)
+
+
+def read_room(comp: Intcode) -> str:
+    """Крутит программу до ожидания ввода и возвращает весь текст."""
+    comp.run_until_input()
+    return flush_output(comp)
+
+
+def send_command(comp: Intcode, cmd: str) -> str:
+    """Отправить одну команду и вернуть текст, появившийся после неё."""
+    for ch in cmd + "\n":
+        comp.inp.append(ord(ch))
+        comp.run_until_input()
+    return flush_output(comp)
+
+
+def parse_room(text: str):
     """
-    Запускает Day25-инткод и проигрывает список текстовых команд.
-    Каждая команда — одна строка (без \n).
-    Возвращает весь ASCII-вывод как одну большую строку.
+    Разбирает вывод комнаты.
+    Возвращает (room_name: str|None, doors: list[str], items: list[str]).
     """
+    lines = text.splitlines()
+    room_name: Optional[str] = None
+    for line in lines:
+        line = line.strip()
+        if line.startswith("== ") and line.endswith("=="):
+            room_name = line
+            break
 
+    if room_name is None:
+        return None, [], []
+
+    doors: List[str] = []
+    items: List[str] = []
+
+    i = 0    # аккуратно пробегаемся по строкам
+    while i < len(lines):
+        line = lines[i].strip()
+
+        if line == "Doors here lead:":
+            i += 1
+            while i < len(lines) and lines[i].strip().startswith("- "):
+                doors.append(lines[i].strip()[2:])
+                i += 1
+            continue
+
+        if line == "Items here:":
+            i += 1
+            while i < len(lines) and lines[i].strip().startswith("- "):
+                items.append(lines[i].strip()[2:])
+                i += 1
+            continue
+
+        i += 1
+
+    return room_name, doors, items
+
+
+# =========================
+#   Обход карты (DFS)
+# =========================
+
+def explore_map(program: List[int]):
+    """
+    Запускает дроида, полностью обходит карту, строит граф комнат и
+    собирает список предметов (не забирая их).
+
+    Возвращает:
+      graph: room -> list[(direction, neighbor_room)]
+      items_by_room: room -> list[safe_item]
+      start_room: str
+      checkpoint_room: str
+      pressure_room: str
+    """
     comp = Intcode(program[:])
-    output_chars: list[str] = []
+
+    # стартовая комната
+    text = read_room(comp)
+    room_name, doors, items = parse_room(text)
+    if room_name is None:
+        raise RuntimeError("Не удалось распарсить стартовую комнату")
+
+    graph: Dict[str, List[Tuple[str, str]]] = {}
+    items_by_room: Dict[str, List[str]] = {}
+    visited: Set[str] = set()
+    checkpoint_room: Optional[str] = None
+    pressure_room: Optional[str] = None
+
+    def dfs(curr_name: str, curr_doors: List[str], curr_items: List[str]):
+        nonlocal checkpoint_room, pressure_room
+
+        if curr_name in visited:
+            return
+        visited.add(curr_name)
+
+        safe_items = [it for it in curr_items if it not in FORBIDDEN_ITEMS]
+        items_by_room[curr_name] = safe_items
+
+        if curr_name == "== Security Checkpoint ==" and checkpoint_room is None:
+            checkpoint_room = curr_name
+        if curr_name == "== Pressure-Sensitive Floor ==" and pressure_room is None:
+            pressure_room = curr_name
+
+        for d in curr_doors:
+            # шаг в соседнюю комнату
+            text2 = send_command(comp, d)
+            next_name, next_doors, next_items = parse_room(text2)
+            if next_name is None:
+                # что-то странное, откатываемся
+                send_command(comp, OPPOSITE[d])
+                continue
+
+            graph.setdefault(curr_name, []).append((d, next_name))
+            graph.setdefault(next_name, []).append((OPPOSITE[d], curr_name))
+
+            dfs(next_name, next_doors, next_items)
+
+            # возвращаемся назад
+            send_command(comp, OPPOSITE[d])
+
+    dfs(room_name, doors, items)
+
+    if checkpoint_room is None:
+        raise RuntimeError("Не найден Security Checkpoint")
+    if pressure_room is None:
+        raise RuntimeError("Не найден Pressure-Sensitive Floor")
+
+    return graph, items_by_room, room_name, checkpoint_room, pressure_room
+
+
+# =========================
+#   BFS по графу комнат
+# =========================
+
+def bfs_path(graph: Dict[str, List[Tuple[str, str]]], start: str, goal: str) -> List[str]:
+    """
+    По графу комнат находим путь как последовательность направлений.
+    Используем обычный BFS.
+    """
+    from collections import deque as dq
+
+    q = dq()
+    q.append(start)
+    prev: Dict[str, Tuple[str, str] | None] = {start: None}
+
+    while q:
+        v = q.popleft()
+        if v == goal:
+            break
+        for d, u in graph.get(v, []):
+            if u not in prev:
+                prev[u] = (v, d)  # пришли в u из v направлением d
+                q.append(u)
+
+    if goal not in prev:
+        raise RuntimeError(f"Нет пути от {start} до {goal}")
+
+    # восстанавливаем путь
+    dirs: List[str] = []
+    cur = goal
+    while prev[cur] is not None:
+        v, d = prev[cur]
+        dirs.append(d)
+        cur = v
+    dirs.reverse()
+    return dirs
+
+
+# =========================
+#   Строим маршрут сбора
+# =========================
+
+def build_collection_route(
+    graph: Dict[str, List[Tuple[str, str]]],
+    items_by_room: Dict[str, List[str]],
+    start_room: str,
+    checkpoint_room: str,
+) -> Tuple[List[str], List[str]]:
+    """
+    Строим маршрут:
+      - от старта до всех комнат с предметами (с командами take ...),
+      - в конце до Security Checkpoint.
+
+    Возвращает (route, full_inventory_list).
+    """
+    # копия предметов
+    items_left: Dict[str, List[str]] = {
+        room: items[:] for room, items in items_by_room.items() if items
+    }
+    current_room = start_room
+    route: List[str] = []
+    full_inv: List[str] = []
+
+    while items_left:
+        targets = list(items_left.keys())
+        best_room: Optional[str] = None
+        best_path: Optional[List[str]] = None
+
+        # находим ближайшую комнату с предметами
+        for room in targets:
+            path = bfs_path(graph, current_room, room)
+            if best_path is None or len(path) < len(best_path):
+                best_path = path
+                best_room = room
+
+        assert best_room is not None and best_path is not None
+
+        # идём по пути
+        for d in best_path:
+            route.append(d)
+        current_room = best_room
+
+        # берём все предметы в комнате
+        for item in items_left[best_room]:
+            route.append(f"take {item}")
+            full_inv.append(item)
+
+        # предметы в комнате закончились
+        del items_left[best_room]
+
+    # когда все предметы собраны, идём к чекпоинту
+    if current_room != checkpoint_room:
+        path_to_checkpoint = bfs_path(graph, current_room, checkpoint_room)
+        for d in path_to_checkpoint:
+            route.append(d)
+        current_room = checkpoint_room
+
+    return route, full_inv
+
+
+# =========================
+#   Запуск сценария (отдельный)
+# =========================
+
+def run_script(program: List[int], commands: List[str]) -> str:
+    """
+    Запускает инткод с нуля и проигрывает список команд,
+    возвращает весь ASCII-вывод.
+    """
+    comp = Intcode(program[:])
+    out_chars: List[str] = []
 
     def flush():
         while comp.out:
-            output_chars.append(chr(comp.out.pop(0)))
+            out_chars.append(chr(comp.out.pop(0)))
 
-    # Стартовый вывод, до первого запроса ввода
+    # стартовый вывод
     comp.run_until_input()
     flush()
 
-    # Подаём команды последовательно
+    # команды
     for cmd in commands:
-        for ch in (cmd + "\n"):
+        for ch in cmd + "\n":
             comp.inp.append(ord(ch))
             comp.run_until_input()
             flush()
             if comp.halted:
-                return "".join(output_chars)
+                return "".join(out_chars)
 
-    # Дочитываем хвост вывода (если он есть)
+    # дочитываем хвост
     while not comp.halted:
         comp.run_until_input()
         flush()
-        # Если программа ждёт ввод, а мы ничего не даём — выходим
         if not comp.inp:
             break
 
-    return "".join(output_chars)
+    return "".join(out_chars)
 
 
-# Маршрут, которым ты уже проходил вручную:
-# - собирает все 8 безопасных предметов
-# - в конце оказывается на Security Checkpoint
-PATH_TO_CHECKPOINT_AND_PICKUP = [
-    'south',
-    'take festive hat',
-    'north',
-    'west',
-    'south',
-    'take pointer',
-    'south',
-    'take prime number',
-    'west',
-    'take coin',
-    'east',
-    'north',
-    'north',
-    'east',
-    'east',
-    'south',
-    'south',
-    'take space heater',
-    'south',
-    'take astrolabe',
-    'north',
-    'north',
-    'north',
-    'north',
-    'take wreath',
-    'north',
-    'west',
-    'take dehydrated water',
-    'north',
-    'east', # отсюда ты уже у Security Checkpoint
-]
+# =========================
+#   Поиск пароля (брутфорс)
+# =========================
 
+def find_password(program: List[int]) -> int:
+    print("▶ Обход карты...")
+    graph, items_by_room, start_room, checkpoint_room, pressure_room = explore_map(program)
+    print("Стартовая комната:", start_room)
+    print("Security Checkpoint:", checkpoint_room)
+    print("Pressure-Sensitive Floor:", pressure_room)
 
-def find_password(program: list[int]) -> int:
-    print("▶ Выполняем маршрут и читаем инвентарь...")
+    print("\nПредметы по комнатам:")
+    for room, items in items_by_room.items():
+        print(" ", room, ":", items)
 
-    out = run_script(program, PATH_TO_CHECKPOINT_AND_PICKUP + ["inv"])
-    inventory: list[str] = []
+    print("\n▶ Строим маршрут сбора предметов...")
+    route, inventory = build_collection_route(graph, items_by_room, start_room, checkpoint_room)
+    print("Построенный маршрут длиной", len(route), "команд")
+    print("Инвентарь для перебора:", inventory)
 
-    # Парсим блок "Items in your inventory:"
-    lines = out.splitlines()
-    inv_mode = False
-    for line in lines:
-        line = line.strip()
-        if line == "Items in your inventory:":
-            inv_mode = True
-            continue
-        if inv_mode:
-            if line.startswith("- "):
-                inventory.append(line[2:])
-            else:
-                inv_mode = False
+    # направление от чекпоинта к плите
+    plate_dir: Optional[str] = None
+    for d, neigh in graph.get(checkpoint_room, []):
+        if neigh == pressure_room:
+            plate_dir = d
+            break
+    if plate_dir is None:
+        raise RuntimeError("Не удалось найти направление от чекпоинта к плите")
 
-    print(f"📦 Найдено предметов: {len(inventory)} → {inventory}")
+    print("Направление к плите из чекпоинта:", plate_dir)
 
-    if len(inventory) != 8:
-        raise RuntimeError(f"Ожидал 8 предметов, а нашёл {len(inventory)}")
-
-    print("\n▶ Начинаю перебор комбинаций...\n")
-
-    # Перебор всех подмножеств предметов
+    print("\n▶ Начинаем перебор комбинаций...\n")
     total = 0
     for r in range(0, len(inventory) + 1):
         for drop_set in itertools.combinations(inventory, r):
             total += 1
-
-            keep_set = [x for x in inventory if x not in drop_set]
+            keep = [x for x in inventory if x not in drop_set]
             print(f"\n===== Попытка #{total} =====")
-            print(f"🔹 Оставляем: {keep_set}")
-            print(f"🔸 Выбрасываем: {list(drop_set)}")
+            print("🔹 Оставляем:", keep)
+            print("🔸 Выбрасываем:", list(drop_set))
 
-            cmds = list(PATH_TO_CHECKPOINT_AND_PICKUP)
-
-            # drop предметов
+            cmds = list(route)
             for item in drop_set:
                 cmds.append(f"drop {item}")
-
             cmds.append("inv")
-            cmds.append("south")  # шаг на плиту
+            cmds.append(plate_dir)
 
             out = run_script(program, cmds)
-
-            # Выводим фразу, сказанную плитой
-            last_lines = out.strip().splitlines()[-5:]
-            print("Ответ плиты:")
+            last_lines = out.strip().splitlines()[-6:]
+            print("Ответ плиты / финальный вывод:")
             for L in last_lines:
                 print("   ", L)
 
-            # Проверяем, появилось ли число
             nums = re.findall(r"\d+", out)
             if nums:
                 password = int(nums[0])
-                print("\n🎉 НАЙДЕНО! ПРАВИЛЬНАЯ КОМБИНАЦИЯ:")
-                print("📦", keep_set)
-                print("🔑 Пароль:", password)
+                print("\n🎉 Найдена комбинация:", keep)
+                print("Пароль:", password)
                 return password
 
-    raise RuntimeError("Не удалось подобрать комбинацию предметов")
+    raise RuntimeError("Не удалось подобрать комбинацию")
 
 
-# ------------------------------
-#  Обёртки под AdventToCode
-# ------------------------------
+# =========================
+#   Обёртки под AdventToCode
+# =========================
+
+def parse_program(text: str) -> List[int]:
+    return [int(x) for x in text.replace("\n", ",").split(",") if x.strip()]
+
 
 def solve_part1(data: str) -> str:
     data = data.strip()
     if not data:
         return "0"
-
     program = parse_program(data)
+    # Запуск брутфорса ТОЛЬКО здесь
     password = find_password(program)
     return str(password)
 
 
 def solve_part2(data: str) -> str:
-    # У Day 25 по сути одна задача — найти этот пароль.
-    # Для совместимости вернём тот же результат.
-    data = data.strip()
-    if not data:
-        return "0"
-
-    program = parse_program(data)
-    password = find_password(program)
-    return str(password)
+    # У Day 25 фактически нет второй части.
+    # Делаем заглушку, чтобы start.py не запускал перебор снова.
+    return "not implemented"
 
 
 if __name__ == "__main__":
